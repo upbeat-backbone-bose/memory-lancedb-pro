@@ -50,6 +50,8 @@ export interface MemorySearchResult {
 export interface StoreConfig {
   dbPath: string;
   vectorDim: number;
+  /** Disable LanceDB native vector search and rank scanned rows with JS cosine. */
+  disableNativeCosine?: boolean;
   onStoragePathWarning?: (message: string) => void;
 }
 
@@ -218,6 +220,13 @@ function isExplicitDenyAllScopeFilter(scopeFilter?: string[]): boolean {
   return Array.isArray(scopeFilter) && scopeFilter.length === 0;
 }
 
+function hasFtsIndex(indices: unknown): boolean {
+  return Array.isArray(indices) && indices.some((idx: any) =>
+    idx?.indexType === "FTS" ||
+    (Array.isArray(idx?.columns) && idx.columns.includes("text")),
+  );
+}
+
 function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight: number }>): number {
   const normalizedQuery = normalizeSearchText(query);
   if (!normalizedQuery) return 0;
@@ -232,6 +241,42 @@ function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight
   }
 
   return score;
+}
+
+function parseBooleanEnvFlag(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test((value ?? "").trim());
+}
+
+function toNumberVector(value: unknown): number[] {
+  if (!value || typeof value !== "object") return [];
+
+  const maybeArrayLike = value as ArrayLike<unknown>;
+  if (typeof maybeArrayLike.length !== "number" || maybeArrayLike.length < 0) {
+    return [];
+  }
+
+  const vector = Array.from(maybeArrayLike, (item) => Number(item));
+  return vector.every(Number.isFinite) ? vector : [];
+}
+
+function cosineSimilarity(left: number[], right: number[]): number {
+  if (!Array.isArray(left) || left.length === 0 || right.length !== left.length) return 0;
+
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < left.length; index++) {
+    const l = Number(left[index]);
+    const r = Number(right[index]);
+    if (!Number.isFinite(l) || !Number.isFinite(r)) return 0;
+    dot += l * r;
+    leftNorm += l * l;
+    rightNorm += r * r;
+  }
+
+  const denominator = Math.sqrt(leftNorm) * Math.sqrt(rightNorm);
+  if (denominator <= 0) return 0;
+  return Math.max(-1, Math.min(1, dot / denominator));
 }
 
 // ============================================================================
@@ -418,7 +463,9 @@ export class MemoryStore {
   private table: LanceDB.Table | null = null;
   private initPromise: Promise<void> | null = null;
   private ftsIndexCreated = false;
+  private _lastFtsError: string | null = null;
   private updateQueue: Promise<void> = Promise.resolve();
+  private nativeCosineFallbackLogged = false;
 
   // Cross-call batch accumulator（Issue #690）
   // 多個 concurrent bulkStore() 會先累積在這裡，每 100ms flush 一次，
@@ -448,12 +495,15 @@ export class MemoryStore {
   private static readonly MAX_PENDING_BATCH_SIZE = 1000;
 
   private readonly config: StoreConfig;
+  private readonly disableNativeCosine: boolean;
 
   constructor(config: StoreConfig) {
+    const envDisablesNativeCosine = parseBooleanEnvFlag(process.env.MEMORY_LANCEDB_DISABLE_NATIVE_COSINE);
     this.config = {
       ...config,
       dbPath: normalizeStoragePath(config.dbPath),
     };
+    this.disableNativeCosine = config.disableNativeCosine === true || envDisablesNativeCosine;
   }
 
   private async runWithFileLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -705,12 +755,14 @@ export class MemoryStore {
     try {
       await this.createFtsIndex(table);
       this.ftsIndexCreated = true;
+      this._lastFtsError = null;
     } catch (err) {
       console.warn(
         "Failed to create FTS index, falling back to vector-only search:",
         err,
       );
       this.ftsIndexCreated = false;
+      this._lastFtsError = err instanceof Error ? err.message : String(err);
     }
 
     this.db = db;
@@ -832,11 +884,8 @@ export class MemoryStore {
     try {
       // Check if FTS index already exists
       const indices = await table.listIndices();
-      const hasFtsIndex = indices?.some(
-        (idx: any) => idx.indexType === "FTS" || idx.columns?.includes("text"),
-      );
 
-      if (!hasFtsIndex) {
+      if (!hasFtsIndex(indices)) {
         // LanceDB @lancedb/lancedb >=0.26: use Index.fts() config
         const lancedb = await loadLanceDB();
         await table.createIndex("text", {
@@ -1346,7 +1395,24 @@ export class MemoryStore {
     const overFetchMultiplier = inactiveFilter ? 20 : 10;
     const fetchLimit = Math.min(safeLimit * overFetchMultiplier, 200);
 
-    let query = this.table!.vectorSearch(vector).distanceType('cosine').limit(fetchLimit);
+    if (this.disableNativeCosine && !this.nativeCosineFallbackLogged) {
+      console.warn(
+        "memory-lancedb-pro: LanceDB native vector cosine disabled; scanning candidates and using JS cosine rerank fallback",
+      );
+      this.nativeCosineFallbackLogged = true;
+    }
+    let query = this.disableNativeCosine
+      ? this.table!.query().select([
+        "id",
+        "text",
+        "vector",
+        "category",
+        "scope",
+        "importance",
+        "timestamp",
+        "metadata",
+      ])
+      : this.table!.vectorSearch(vector).distanceType("cosine").limit(fetchLimit);
 
     // Apply scope filter if provided
     if (scopeFilter && scopeFilter.length > 0) {
@@ -1360,7 +1426,11 @@ export class MemoryStore {
     const mapped: MemorySearchResult[] = [];
 
     for (const row of results) {
-      const distance = Number(row._distance ?? 0);
+      const rowVector = toNumberVector(row.vector);
+      if (rowVector.length !== vector.length) continue;
+      const distance = this.disableNativeCosine
+        ? 1 - cosineSimilarity(vector, rowVector)
+        : Number(row._distance ?? 0);
       const score = 1 / (1 + distance);
 
       if (score < minScore) continue;
@@ -1379,7 +1449,7 @@ export class MemoryStore {
       const entry: MemoryEntry = {
         id: row.id as string,
         text: row.text as string,
-        vector: row.vector as number[],
+        vector: rowVector,
         category: row.category as MemoryEntry["category"],
         scope: rowScope,
         importance: Number(row.importance),
@@ -1394,10 +1464,14 @@ export class MemoryStore {
 
       mapped.push({ entry, score });
 
-      if (mapped.length >= safeLimit) break;
+      if (!this.disableNativeCosine && mapped.length >= safeLimit) break;
     }
 
-    return mapped;
+    if (this.disableNativeCosine) {
+      mapped.sort((a, b) => b.score - a.score);
+    }
+
+    return mapped.slice(0, safeLimit);
   }
 
   async bm25Search(
@@ -1415,7 +1489,7 @@ export class MemoryStore {
     // Over-fetch when filtering inactive records to avoid crowding
     const fetchLimit = inactiveFilter ? Math.min(safeLimit * 20, 200) : safeLimit;
 
-    if (!this.ftsIndexCreated) {
+    if (!this.ftsIndexCreated && !(await this.refreshFtsSupportFromTable())) {
       return this.lexicalFallbackSearch(query, safeLimit, scopeFilter, options);
     }
 
@@ -1698,6 +1772,7 @@ export class MemoryStore {
     categoryCounts: Record<string, number>;
   }> {
     await this.ensureInitialized();
+    await this.refreshFtsSupportFromTable();
 
     if (isExplicitDenyAllScopeFilter(scopeFilter)) {
       return {
@@ -1954,11 +2029,29 @@ export class MemoryStore {
     return this.ftsIndexCreated;
   }
 
-  /** Last FTS error for diagnostics */
-  private _lastFtsError: string | null = null;
-
   get lastFtsError(): string | null {
     return this._lastFtsError;
+  }
+
+  private async refreshFtsSupportFromTable(): Promise<boolean> {
+    if (!this.table) return this.ftsIndexCreated;
+
+    try {
+      const indices = await this.table.listIndices();
+      const available = hasFtsIndex(indices);
+      this.ftsIndexCreated = available;
+      if (available) this._lastFtsError = null;
+      return available;
+    } catch (err) {
+      this.ftsIndexCreated = false;
+      this._lastFtsError = err instanceof Error ? err.message : String(err);
+      return false;
+    }
+  }
+
+  async refreshFtsSupport(): Promise<boolean> {
+    await this.ensureInitialized();
+    return this.refreshFtsSupportFromTable();
   }
 
   /** Get FTS index health status */
