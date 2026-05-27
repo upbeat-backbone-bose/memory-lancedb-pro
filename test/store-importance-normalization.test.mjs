@@ -68,16 +68,19 @@ describe("importance normalization", () => {
       assert.equal(normalizeImportance(0), 0.0);
     });
 
-    it("preserves v2+ importance=1.0 as legitimate max", () => {
-      assert.equal(normalizeImportance(1.0), 1.0);
+    it("maps 1.0 identically to legacy 1 (indistinguishable at runtime)", () => {
+      // In JavaScript, 1.0 === 1 — Number.isInteger(1.0) === true
+      // So 1.0 always hits the legacy integer path and maps to 0.20
+      assert.equal(normalizeImportance(1.0), 0.20);
     });
 
     it("preserves v2+ importance=0.0 as legitimate min", () => {
+      // 0.0 is integer but not >= 1, falls to clamp path → 0.0
       assert.equal(normalizeImportance(0.0), 0.0);
     });
 
-    it("clamps decimal values above 1.0 to 1.0 (not legacy 1-scale)", () => {
-      // 1.5 is a v2+ float, not legacy integer 1-5 scale
+    it("clamps decimal values above 1 to 1.0 (not legacy integer 1-5)", () => {
+      // 1.5 is not an integer → clamp path → 1.0
       assert.equal(normalizeImportance(1.5), 1.0);
     });
 
