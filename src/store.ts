@@ -193,7 +193,9 @@ export function normalizeImportance(value: number): number {
     return [null, 0.20, 0.40, 0.60, 0.80, 0.95][value];
   }
 
-  // v2+ 0~1 float: clamp outliers (1.0 is the legitimate max)
+  // v2+ 0~1 float: clamp outliers.
+  // Note: 1.0 is indistinguishable from legacy integer 1 in JS (Number.isInteger(1.0) === true),
+  // so it always hits the legacy path above and maps to 0.20.
   return Math.max(0.0, Math.min(1.0, value));
 }
 
