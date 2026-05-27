@@ -116,6 +116,7 @@ interface PluginConfig {
     taskPassage?: string;
     normalized?: boolean;
     chunking?: boolean;
+    clientTimeoutMs?: number;
   };
   dbPath?: string;
   autoCapture?: boolean;
@@ -169,6 +170,8 @@ interface PluginConfig {
     timeDecayHalfLifeDays?: number;
     reinforcementFactor?: number;
     maxHalfLifeMultiplier?: number;
+    /** Disable LanceDB native vector search and rank scanned rows with JS cosine. */
+    disableNativeCosine?: boolean;
   };
   decay?: {
     recencyHalfLifeDays?: number;
@@ -1355,16 +1358,7 @@ function buildReflectionFallbackText(): string {
     "- (none captured)",
     "",
     "## Learning governance candidates (.learnings / promotion / skill extraction)",
-    "### Entry 1",
-    "**Priority**: medium",
-    "**Status**: triage",
-    "**Area**: config",
-    "### Summary",
-    "Investigate last failed tool execution and decide whether it belongs in .learnings/ERRORS.md.",
-    "### Details",
-    "The reflection pipeline fell back; confirm the failure is reproducible before treating it as a durable error record.",
-    "### Suggested Action",
-    "Reproduce the latest failed tool execution, classify it as triage or error, and then log it with the appropriate tool/file path evidence.",
+    "- (none captured)",
     "",
     "## Open loops / next actions",
     "- Investigate why embedded reflection generation failed.",
@@ -2012,6 +2006,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
   const store = new MemoryStore({
     dbPath: resolvedDbPath,
     vectorDim,
+    disableNativeCosine: config.retrieval?.disableNativeCosine === true,
     onStoragePathWarning: (message) => api.logger.warn(message),
   });
   const embedder = createEmbedder({
@@ -2026,6 +2021,7 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     taskPassage: config.embedding.taskPassage,
     normalized: config.embedding.normalized,
     chunking: config.embedding.chunking,
+    clientTimeoutMs: config.embedding.clientTimeoutMs,
   });
   const decayEngine = createDecayEngine({
     ...DEFAULT_DECAY_CONFIG,
@@ -4266,7 +4262,9 @@ const memoryLanceDBProPlugin = {
             throw new Error(`Failed to allocate unique reflection file for ${dateStr} ${timeCompact}`);
           }
 
-          const reflectionGovernanceCandidates = extractReflectionLearningGovernanceCandidates(reflectionText);
+          const reflectionGovernanceCandidates = reflectionGenerated.usedFallback
+            ? []
+            : extractReflectionLearningGovernanceCandidates(reflectionText);
           if (config.selfImprovement?.enabled !== false && reflectionGovernanceCandidates.length > 0) {
             for (const candidate of reflectionGovernanceCandidates) {
               const appendResult = await appendSelfImprovementEntry({
@@ -4662,7 +4660,7 @@ const memoryLanceDBProPlugin = {
           try {
             // Test components (bounded time)
             const embedTest = await withTimeout(
-              embedder.test(),
+              embedder.test({ timeoutMs: 7_500 }),
               8_000,
               "embedder.test()",
             );
@@ -4841,6 +4839,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
         typeof embedding.chunking === "boolean"
           ? embedding.chunking
           : undefined,
+      clientTimeoutMs: parsePositiveInt(embedding.clientTimeoutMs),
     },
     dbPath: typeof cfg.dbPath === "string" ? cfg.dbPath : undefined,
     autoCapture: cfg.autoCapture !== false,
