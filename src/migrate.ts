@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import fs from "node:fs/promises";
 import type { MemoryStore, MemoryEntry } from "./store.js";
-import { loadLanceDB, normalizeLegacyImportance } from "./store.js";
+import { loadLanceDB } from "./store.js";
 
 // ============================================================================
 // Types
@@ -169,7 +169,9 @@ export class MemoryMigrator {
         id: row.id as string,
         text: row.text as string,
         vector: normalizeLegacyVector(row.vector),
-        importance: normalizeLegacyImportance(Number(row.importance)),
+        // Keep raw legacy importance; importEntry({ legacy: true }) normalizes
+        // it exactly once at the explicit legacy-provenance boundary.
+        importance: Number(row.importance),
         category: (row.category as LegacyMemoryEntry["category"]) || "other",
         createdAt: Number(row.createdAt),
         scope: row.scope as string | undefined,
@@ -209,13 +211,17 @@ export class MemoryMigrator {
         }
 
         // Convert legacy entry to new format while preserving legacy identity.
+        // Pass the raw legacy importance through to importEntry with
+        // { legacy: true } so normalization happens exactly once at this
+        // explicit legacy-provenance boundary (avoids repeated calls to a
+        // non-idempotent legacy normalizer on out-of-range/corrupt data).
         const newEntry: MemoryEntry = {
           id: legacy.id,
           text: legacy.text,
           vector: legacy.vector,
           category: legacy.category,
           scope: legacy.scope || defaultScope,
-          importance: normalizeLegacyImportance(legacy.importance),
+          importance: legacy.importance,
           timestamp: Number.isFinite(legacy.createdAt) ? legacy.createdAt : Date.now(),
           metadata: JSON.stringify({
             migratedFrom: "memory-lancedb",
@@ -224,7 +230,7 @@ export class MemoryMigrator {
           }),
         };
 
-        await this.targetStore.importEntry(newEntry);
+        await this.targetStore.importEntry(newEntry, { legacy: true });
         migrated++;
 
         if (migrated % 100 === 0) {

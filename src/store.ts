@@ -82,6 +82,16 @@ export interface MemoryBulkUpdateResult {
   error?: string;
 }
 
+export interface ImportEntryOptions {
+  /**
+   * Treat the entry as known-legacy data (v1.x 1-5 integer importance scale)
+   * and apply `normalizeLegacyImportance` once at this explicit legacy-
+   * provenance boundary. Defaults to false — generic v2+ imports use
+   * `clampImportance` to preserve 0, 1, and decimal values.
+   */
+  legacy?: boolean;
+}
+
 // ============================================================================
 // LanceDB Dynamic Import
 // ============================================================================
@@ -218,10 +228,12 @@ export function clampImportance(value: number): number {
 /**
  * @deprecated Use normalizeLegacyImportance (for legacy data) or clampImportance
  * (for v2+ data) based on data provenance. This wrapper is kept for backward
- * compatibility and routes to normalizeLegacyImportance.
+ * compatibility and routes to clampImportance (v2+ 0~1 semantics). The previous
+ * behavior routed to legacy normalization, which surprised callers expecting
+ * generic v2 clamp semantics (see PR #828 review).
  */
 export function normalizeImportance(value: number): number {
-  return normalizeLegacyImportance(value);
+  return clampImportance(value);
 }
 
 function normalizePredicateTimestamp(value: unknown): number | null {
@@ -1456,8 +1468,17 @@ export class MemoryStore {
    * Import a pre-built entry while preserving its id/timestamp.
    * Used for re-embedding / migration / A/B testing across embedding models.
    * Intentionally separate from `store()` to keep normal writes simple.
+   *
+   * Default behavior treats the entry as a generic v2+ import and applies
+   * idempotent `clampImportance` (preserves 0, 1, and decimal v2+ values).
+   * For known-legacy data sources (e.g. `migrate.ts` / explicit backfill),
+   * pass `{ legacy: true }` to apply the v1.x 1-5 integer → 0~1 mapping
+   * exactly once at this explicit legacy-provenance boundary.
    */
-  async importEntry(entry: MemoryEntry): Promise<MemoryEntry> {
+  async importEntry(
+    entry: MemoryEntry,
+    options: ImportEntryOptions = {},
+  ): Promise<MemoryEntry> {
     await this.ensureInitialized();
 
     if (!entry.id || typeof entry.id !== "string") {
@@ -1474,7 +1495,9 @@ export class MemoryStore {
     const full: MemoryEntry = {
       ...entry,
       scope: entry.scope || "global",
-      importance: normalizeLegacyImportance(entry.importance),
+      importance: options.legacy
+        ? normalizeLegacyImportance(entry.importance)
+        : clampImportance(entry.importance),
       timestamp: normalizeMemoryTimestamp(entry.timestamp),
       metadata: entry.metadata || "{}",
     };
