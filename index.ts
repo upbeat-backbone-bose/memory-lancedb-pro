@@ -139,6 +139,18 @@ interface PluginConfig {
       initialDelayMs?: number;
     };
   };
+  redisUrl?: string;
+  locking?: {
+    redis?: {
+      enabled?: boolean;
+      url?: string;
+      keyPrefix?: string;
+      ttlMs?: number;
+      acquireTimeoutMs?: number;
+      retryDelayMs?: number;
+      connectTimeoutMs?: number;
+    };
+  };
   autoCapture?: boolean;
   autoRecall?: boolean;
   autoRecallMinLength?: number;
@@ -430,6 +442,11 @@ function resolveFirstApiKey(api: Pick<OpenClawPluginApi, "resolvePath">, apiKey:
     throw new Error("embedding.apiKey is empty");
   }
   return resolveSecretCredential(api, key, "embedding.apiKey");
+}
+
+function resolveOptionalEnvString(value: unknown): string | undefined {
+  const raw = asNonEmptyString(value);
+  return raw ? resolveEnvVars(raw) : undefined;
 }
 
 function resolveOptionalPathWithEnv(
@@ -2248,7 +2265,9 @@ function _initPluginState(api: OpenClawPluginApi): PluginSingletonState {
     dbPath: resolvedDbPath,
     vectorDim,
     disableNativeCosine: config.retrieval?.disableNativeCosine === true,
+    redisLock: config.locking?.redis,
     onStoragePathWarning: (message) => api.logger.warn(message),
+    onLockWarning: (message) => api.logger.warn(message),
   });
   const embedder = createEmbedder({
     provider: "openai-compatible",
@@ -2540,6 +2559,7 @@ const memoryLanceDBProPlugin = {
     // ========================================================================
     _registeredApis.add(api);    // claim before init (Phase 2 singleton guard)
     _registeredApisMap.set(api, true);  // dual-track: explicit claim for rollback
+    let registrationStopped = false;
     let singleton: typeof _singletonState;
     try {
       if (!_singletonState) { _singletonState = _initPluginState(api); }
@@ -5297,6 +5317,12 @@ const memoryLanceDBProPlugin = {
         }
       },
       stop: async () => {
+        if (registrationStopped) {
+          return;
+        }
+        registrationStopped = true;
+        _registeredApis.delete(api);
+        _registeredApisMap.delete(api);
         if (backupTimer) {
           clearInterval(backupTimer);
           backupTimer = null;
@@ -5308,6 +5334,17 @@ const memoryLanceDBProPlugin = {
         if (storageMaintenanceTimer) {
           clearInterval(storageMaintenanceTimer);
           storageMaintenanceTimer = null;
+        }
+        if (_registeredApisMap.size === 0 && _singletonState?.store === store) {
+          try {
+            await store.destroy();
+          } catch (err) {
+            api.logger.warn(`memory-lancedb-pro: stop cleanup failed: ${String(err)}`);
+          } finally {
+            if (_singletonState?.store === store) {
+              _singletonState = null;
+            }
+          }
         }
         api.logger.info("memory-lancedb-pro: stopped");
       },
@@ -5393,6 +5430,29 @@ export function parsePluginConfig(value: unknown): PluginConfig {
   const storageAutoCleanupRaw = typeof storageMaintenanceRaw?.autoCleanup === "object" && storageMaintenanceRaw.autoCleanup !== null
     ? storageMaintenanceRaw.autoCleanup as Record<string, unknown>
     : null;
+  const lockingRaw = typeof cfg.locking === "object" && cfg.locking !== null
+    ? cfg.locking as Record<string, unknown>
+    : null;
+  const redisLockRaw = typeof lockingRaw?.redis === "object" && lockingRaw.redis !== null
+    ? lockingRaw.redis as Record<string, unknown>
+    : null;
+  const redisLockExplicitlyDisabled = redisLockRaw?.enabled === false;
+  const nestedRedisUrl = redisLockExplicitlyDisabled
+    ? undefined
+    : resolveOptionalEnvString(redisLockRaw?.url);
+  const legacyRedisUrl = redisLockExplicitlyDisabled || nestedRedisUrl
+    ? undefined
+    : resolveOptionalEnvString(cfg.redisUrl);
+  const redisLockUrl = redisLockExplicitlyDisabled
+    ? undefined
+    : (
+        nestedRedisUrl ??
+        legacyRedisUrl ??
+        asNonEmptyString(process.env.MEMORY_LANCEDB_REDIS_URL)
+      );
+  const redisLockEnabled =
+    !redisLockExplicitlyDisabled &&
+    (redisLockRaw?.enabled === true || Boolean(redisLockUrl));
   const userMdExclusiveRaw = typeof workspaceBoundaryRaw?.userMdExclusive === "object" && workspaceBoundaryRaw.userMdExclusive !== null
     ? workspaceBoundaryRaw.userMdExclusive as Record<string, unknown>
     : null;
@@ -5464,6 +5524,20 @@ export function parsePluginConfig(value: unknown): PluginConfig {
           intervalHours: parsePositiveInt(storageAutoCleanupRaw.intervalHours) ?? 24,
           retentionDays: parsePositiveInt(storageAutoCleanupRaw.retentionDays) ?? 7,
           initialDelayMs: parseNonNegativeInt(storageAutoCleanupRaw.initialDelayMs) ?? 300_000,
+        },
+      }
+      : undefined,
+    redisUrl: legacyRedisUrl,
+    locking: redisLockRaw || redisLockUrl
+      ? {
+        redis: {
+          enabled: redisLockEnabled,
+          url: redisLockUrl,
+          keyPrefix: asNonEmptyString(redisLockRaw?.keyPrefix),
+          ttlMs: parsePositiveInt(redisLockRaw?.ttlMs) ?? 60_000,
+          acquireTimeoutMs: parsePositiveInt(redisLockRaw?.acquireTimeoutMs) ?? 5_000,
+          retryDelayMs: parsePositiveInt(redisLockRaw?.retryDelayMs) ?? 50,
+          connectTimeoutMs: parsePositiveInt(redisLockRaw?.connectTimeoutMs) ?? 1_000,
         },
       }
       : undefined,

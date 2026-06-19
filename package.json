@@ -65,7 +65,8 @@
     "@lancedb/lancedb-darwin-x64": "^0.26.2",
     "@lancedb/lancedb-linux-arm64-gnu": "^0.26.2",
     "@lancedb/lancedb-linux-x64-gnu": "^0.26.2",
-    "@lancedb/lancedb-win32-x64-msvc": "^0.26.2"
+    "@lancedb/lancedb-win32-x64-msvc": "^0.26.2",
+    "ioredis": "^5.11.1"
   },
   "devDependencies": {
     "commander": "^14.0.0",
